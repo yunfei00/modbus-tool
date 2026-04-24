@@ -6,10 +6,11 @@
 from __future__ import annotations
 
 import csv
+import time
 import traceback
 from datetime import datetime
 from pathlib import Path
-from typing import List, Optional
+from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
 from PySide6.QtGui import QFont
@@ -68,10 +69,11 @@ class MainWindow(QWidget):
 
     LEFT_PANEL_WIDTH = 380
     OP_FIELD_MIN_WIDTH = 220
+    MIN_POLL_INTERVAL_MS = 300
 
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle(f"{APP_NAME} V2")
+        self.setWindowTitle(f"{APP_NAME} V3")
         self.resize(1280, 760)
         self.setMinimumSize(1000, 650)
 
@@ -81,9 +83,22 @@ class MainWindow(QWidget):
         self._polling_active = False
         self._last_registers: Optional[List[int]] = None
         self._last_start_addr: int = 0
+        self._last_values_by_addr: Dict[int, int] = {}
+        self._batch_mode: bool = False
+        self._batch_addresses: List[int] = []
+        self._manual_disconnect: bool = False
+        self._last_conn_params: dict = {}
+        self._reconnect_in_progress: bool = False
+        self._throttle_warn_ts: float = 0.0
+        self._success_count: int = 0
+        self._failure_count: int = 0
+        self._timeout_count: int = 0
 
         self._poll_timer = QTimer(self)
         self._poll_timer.timeout.connect(self._on_poll_tick)
+        self._reconnect_timer = QTimer(self)
+        self._reconnect_timer.setSingleShot(True)
+        self._reconnect_timer.timeout.connect(self._attempt_reconnect)
 
         self._build_ui()
         self._wire_signals()
@@ -101,7 +116,7 @@ class MainWindow(QWidget):
 
         self.append_log(
             "INFO",
-            f"{APP_NAME} V2 启动完成，默认通讯方式：RTU",
+            f"{APP_NAME} V3 启动完成，默认通讯方式：RTU",
         )
         self.append_log("INFO", "结果表暂无数据，请执行读取操作。")
         self._refresh_serial_ports(log_info=False, is_startup=True)
@@ -242,6 +257,11 @@ class MainWindow(QWidget):
         self.spin_addr.setMinimumWidth(self.OP_FIELD_MIN_WIDTH)
         op_layout.addRow("起始地址:", self.spin_addr)
 
+        self.edit_batch_addrs = QLineEdit()
+        self.edit_batch_addrs.setMinimumWidth(self.OP_FIELD_MIN_WIDTH)
+        self.edit_batch_addrs.setPlaceholderText("可选：批量地址，例如 0,1,5,10")
+        op_layout.addRow("批量地址:", self.edit_batch_addrs)
+
         self.spin_count = QSpinBox()
         self.spin_count.setRange(1, 125)
         self.spin_count.setValue(10)
@@ -253,9 +273,18 @@ class MainWindow(QWidget):
         op_layout.addRow("写入值:", self.edit_values)
 
         self.btn_exec = QPushButton("执行")
-        self.btn_exec.setFixedHeight(32)
+        self.btn_exec.setFixedHeight(34)
         self.btn_exec.setMinimumWidth(self.OP_FIELD_MIN_WIDTH)
         op_layout.addRow(self.btn_exec)
+
+        action_row = QHBoxLayout()
+        self.btn_read_once = QPushButton("一键读取")
+        self.btn_clear_result = QPushButton("清空结果")
+        self.btn_reset_config = QPushButton("重置配置")
+        action_row.addWidget(self.btn_read_once)
+        action_row.addWidget(self.btn_clear_result)
+        action_row.addWidget(self.btn_reset_config)
+        op_layout.addRow(action_row)
 
         left_col.addWidget(op_group)
 
@@ -267,7 +296,7 @@ class MainWindow(QWidget):
         row_pi = QHBoxLayout()
         row_pi.addWidget(QLabel("间隔 (ms):"))
         self.spin_poll_interval = QSpinBox()
-        self.spin_poll_interval.setRange(100, 600_000)
+        self.spin_poll_interval.setRange(self.MIN_POLL_INTERVAL_MS, 600_000)
         self.spin_poll_interval.setValue(1000)
         self.spin_poll_interval.setMinimumWidth(120)
         row_pi.addWidget(self.spin_poll_interval)
@@ -282,6 +311,17 @@ class MainWindow(QWidget):
         poll_layout.addLayout(row_pb)
         left_col.addWidget(poll_group)
 
+        stats_group = QGroupBox("错误统计")
+        stats_layout = QFormLayout(stats_group)
+        stats_layout.setContentsMargins(8, 8, 8, 8)
+        self.lbl_success_count = QLabel("0")
+        self.lbl_failure_count = QLabel("0")
+        self.lbl_timeout_count = QLabel("0")
+        stats_layout.addRow("成功次数:", self.lbl_success_count)
+        stats_layout.addRow("失败次数:", self.lbl_failure_count)
+        stats_layout.addRow("超时次数:", self.lbl_timeout_count)
+        left_col.addWidget(stats_group)
+
         # --- 连接状态
         status_group = QGroupBox("连接状态")
         status_layout = QHBoxLayout(status_group)
@@ -290,6 +330,8 @@ class MainWindow(QWidget):
         self.lbl_status_icon.setFixedWidth(22)
         self.lbl_status_icon.setAlignment(Qt.AlignCenter)
         self.lbl_status_text = QLabel("状态：未连接")
+        self.lbl_status_text.setMinimumHeight(36)
+        self.lbl_status_text.setAlignment(Qt.AlignCenter)
         status_layout.addWidget(self.lbl_status_icon)
         status_layout.addWidget(self.lbl_status_text, stretch=1)
         left_col.addWidget(status_group)
@@ -330,6 +372,8 @@ class MainWindow(QWidget):
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(34)
+        self.table.setStyleSheet("QTableWidget { font-size: 13px; }")
         res_layout.addWidget(self.table)
         splitter.addWidget(res_group)
 
@@ -349,6 +393,7 @@ class MainWindow(QWidget):
         if not _mono.exactMatch():
             _mono = QFont("Courier New", 10)
         self.log.setFont(_mono)
+        self._apply_button_style()
         log_outer.addWidget(self.log)
         splitter.addWidget(log_group)
 
@@ -358,12 +403,19 @@ class MainWindow(QWidget):
         right_col.addWidget(splitter)
         root.addWidget(right_panel, stretch=1)
 
+    def _apply_button_style(self) -> None:
+        for btn in self.findChildren(QPushButton):
+            btn.setMinimumHeight(34)
+
     def _wire_signals(self) -> None:
         self.combo_conn.currentIndexChanged.connect(self._on_conn_type_changed)
         self.btn_refresh_ports.clicked.connect(self._refresh_serial_ports)
         self.btn_connect.clicked.connect(self._on_connect)
         self.btn_disconnect.clicked.connect(self._on_disconnect)
         self.btn_exec.clicked.connect(self._on_execute)
+        self.btn_read_once.clicked.connect(self._on_read_once)
+        self.btn_clear_result.clicked.connect(self._on_clear_result)
+        self.btn_reset_config.clicked.connect(self._on_reset_config)
         self.combo_fc.currentIndexChanged.connect(self._on_fc_changed)
         self.combo_dtype.currentTextChanged.connect(self._on_parse_options_changed)
         self.combo_endian.currentTextChanged.connect(self._on_parse_options_changed)
@@ -405,13 +457,43 @@ class MainWindow(QWidget):
 
     def _set_connection_status(self, connected: bool) -> None:
         if connected:
-            self.lbl_status_icon.setStyleSheet("color: #43A047; font-size: 16px;")
+            self.lbl_status_icon.setStyleSheet("color: #43A047; font-size: 22px;")
             self.lbl_status_text.setText("状态：已连接")
-            self.lbl_status_text.setStyleSheet("color: #2E7D32; font-weight: bold;")
+            self.lbl_status_text.setStyleSheet(
+                "color: #1B5E20; font-size: 15px; font-weight: 700; "
+                "background: #E8F5E9; border: 1px solid #81C784; border-radius: 6px;"
+            )
         else:
-            self.lbl_status_icon.setStyleSheet("color: #E53935; font-size: 16px;")
+            self.lbl_status_icon.setStyleSheet("color: #E53935; font-size: 22px;")
             self.lbl_status_text.setText("状态：未连接")
-            self.lbl_status_text.setStyleSheet("color: #C62828; font-weight: bold;")
+            self.lbl_status_text.setStyleSheet(
+                "color: #B71C1C; font-size: 15px; font-weight: 700; "
+                "background: #FFEBEE; border: 1px solid #EF9A9A; border-radius: 6px;"
+            )
+
+    def _refresh_stats_labels(self) -> None:
+        self.lbl_success_count.setText(str(self._success_count))
+        self.lbl_failure_count.setText(str(self._failure_count))
+        self.lbl_timeout_count.setText(str(self._timeout_count))
+
+    def _record_success(self) -> None:
+        self._success_count += 1
+        self._refresh_stats_labels()
+        self.append_log(
+            "INFO",
+            f"统计更新：成功={self._success_count} 失败={self._failure_count} 超时={self._timeout_count}",
+        )
+
+    def _record_failure(self, exc: BaseException) -> None:
+        self._failure_count += 1
+        txt = str(exc).lower()
+        if "timeout" in txt or "timed out" in txt or isinstance(exc, TimeoutError):
+            self._timeout_count += 1
+        self._refresh_stats_labels()
+        self.append_log(
+            "WARN",
+            f"统计更新：成功={self._success_count} 失败={self._failure_count} 超时={self._timeout_count}",
+        )
 
     # ------------------------------------------------------------------ 串口
     def _refresh_serial_ports(self, log_info: bool = True, is_startup: bool = False) -> None:
@@ -487,14 +569,20 @@ class MainWindow(QWidget):
             self.spin_count.setEnabled(is_read or is_multi)
 
         self.edit_values.setEnabled(is_single or is_multi)
+        self.edit_batch_addrs.setEnabled(is_read)
 
         if is_read:
             self.edit_values.clear()
             self.edit_values.setPlaceholderText("读操作无需填写写入值")
+            self.edit_batch_addrs.setPlaceholderText("可选：批量地址，例如 0,1,5,10")
         elif is_single:
             self.edit_values.setPlaceholderText("请输入单个寄存器值，例如 123")
+            self.edit_batch_addrs.clear()
+            self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
         else:
             self.edit_values.setPlaceholderText("请输入多个寄存器值，例如 1,2,3,4")
+            self.edit_batch_addrs.clear()
+            self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
 
     def _update_poll_controls_enabled(self) -> None:
         fc_ok = self._current_fc() in ("03", "04")
@@ -537,6 +625,9 @@ class MainWindow(QWidget):
         if not self.chk_poll.isChecked():
             self._show_warning("轮询", "请先勾选「启用轮询」。")
             return
+        if int(self.spin_poll_interval.value()) < self.MIN_POLL_INTERVAL_MS:
+            self.spin_poll_interval.setValue(self.MIN_POLL_INTERVAL_MS)
+            self.append_log("WARN", f"轮询间隔过小，已调整为 {self.MIN_POLL_INTERVAL_MS} ms")
         self._polling_active = True
         self._poll_timer.setInterval(int(self.spin_poll_interval.value()))
         self._poll_timer.start()
@@ -553,9 +644,14 @@ class MainWindow(QWidget):
 
     def _on_poll_tick(self) -> None:
         if not self._polling_active or not self._client.is_connected():
-            self._stop_polling_internal(silent=True)
+            if self._polling_active and not self._client.is_connected():
+                self._schedule_reconnect("轮询检测到连接断开")
             return
         if self._poll_busy or self._exec_busy:
+            now = time.monotonic()
+            if now - self._throttle_warn_ts > 3:
+                self.append_log("INFO", "请求节流：上一次请求未完成，跳过本次轮询。")
+                self._throttle_warn_ts = now
             return
         if self._current_fc() not in ("03", "04"):
             self._stop_polling_internal()
@@ -563,8 +659,12 @@ class MainWindow(QWidget):
         self._poll_busy = True
         try:
             self._perform_read_and_fill(log_tx_rx=True, log_ok=False)
+            self._record_success()
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
             self.append_log("ERROR", f"轮询失败: {self._format_user_exception(exc)}")
+            if self._is_connection_like_error(exc):
+                self._schedule_reconnect(str(exc))
         finally:
             self._poll_busy = False
 
@@ -575,6 +675,7 @@ class MainWindow(QWidget):
             return
 
         try:
+            self._manual_disconnect = False
             if self.combo_conn.currentText() == "TCP":
                 host = self.edit_host.text().strip()
                 if not host:
@@ -607,8 +708,13 @@ class MainWindow(QWidget):
             return
 
         self._set_connected_ui(True)
+        self._store_connection_params()
+        self._reconnect_in_progress = False
 
     def _on_disconnect(self) -> None:
+        self._manual_disconnect = True
+        self._reconnect_timer.stop()
+        self._reconnect_in_progress = False
         self._stop_polling_internal(silent=True)
         self._client.close()
         self._set_connected_ui(False)
@@ -634,6 +740,7 @@ class MainWindow(QWidget):
     def _clear_result_table(self) -> None:
         self.table.setRowCount(0)
         self._last_registers = None
+        self._last_values_by_addr.clear()
         self.append_log("INFO", "结果表暂无数据，请执行读取操作。")
 
     def _fill_table(self, start_addr: int, registers: List[int]) -> None:
@@ -649,29 +756,161 @@ class MainWindow(QWidget):
             self.table.setItem(row, 2, QTableWidgetItem(_fmt_reg_hex(val)))
             self.table.setItem(row, 3, QTableWidgetItem(_fmt_reg_bin(val)))
             self.table.setItem(row, 4, QTableWidgetItem(""))
+            self._last_values_by_addr[addr] = val
         self._apply_parsed_column()
 
+    def _fill_batch_table(self, values_by_addr: Dict[int, int]) -> None:
+        self.table.setRowCount(0)
+        self._last_registers = list(values_by_addr.values())
+        for addr in sorted(values_by_addr.keys()):
+            val = values_by_addr[addr]
+            prev = self._last_values_by_addr.get(addr)
+            row = self.table.rowCount()
+            self.table.insertRow(row)
+            addr_item = QTableWidgetItem(str(addr))
+            val_item = QTableWidgetItem(str(val))
+            hex_item = QTableWidgetItem(_fmt_reg_hex(val))
+            bin_item = QTableWidgetItem(_fmt_reg_bin(val))
+            parsed_item = QTableWidgetItem(str(val))
+            if prev is not None and val != prev:
+                for item in (val_item, hex_item, bin_item, parsed_item):
+                    item.setForeground(Qt.GlobalColor.red if val > prev else Qt.GlobalColor.blue)
+                self.append_log(
+                    "INFO",
+                    f"地址 {addr} 数值变化：{prev} -> {val}（{'变大' if val > prev else '变小'}）",
+                )
+            self.table.setItem(row, 0, addr_item)
+            self.table.setItem(row, 1, val_item)
+            self.table.setItem(row, 2, hex_item)
+            self.table.setItem(row, 3, bin_item)
+            self.table.setItem(row, 4, parsed_item)
+            self._last_values_by_addr[addr] = val
+
     # ------------------------------------------------------------------ 读 / 执行
+    def _parse_batch_addresses(self) -> List[int]:
+        text = self.edit_batch_addrs.text().strip()
+        if not text:
+            return []
+        values: List[int] = []
+        seen: set[int] = set()
+        for part in text.split(","):
+            s = part.strip()
+            if not s:
+                continue
+            addr = int(s, 0)
+            if not 0 <= addr <= 65535:
+                raise ValueError(f"地址超出范围(0~65535): {s}")
+            if addr not in seen:
+                seen.add(addr)
+                values.append(addr)
+        if not values:
+            raise ValueError("批量地址不能为空，请使用英文逗号分隔，例如 0,1,5")
+        return values
+
+    def _do_read_single_address(self, fc: str, unit_id: int, address: int) -> int:
+        if fc == "03":
+            return self._client.read_holding_registers(unit_id, address, 1)[0]
+        return self._client.read_input_registers(unit_id, address, 1)[0]
+
+    def _is_connection_like_error(self, exc: BaseException) -> bool:
+        txt = str(exc).lower()
+        marks = ("timeout", "timed out", "connection", "no response", "socket", "通讯异常")
+        return any(mark in txt for mark in marks)
+
+    def _store_connection_params(self) -> None:
+        if self.combo_conn.currentText() == "TCP":
+            self._last_conn_params = {
+                "kind": "TCP",
+                "host": self.edit_host.text().strip(),
+                "port": int(self.spin_port.value()),
+            }
+        else:
+            self._last_conn_params = {
+                "kind": "RTU",
+                "port": self._current_serial_device(),
+                "baudrate": int(self.spin_baud.value()),
+                "bytesize": int(self.spin_bytesize.currentText()),
+                "parity": self.combo_parity.currentText(),
+                "stopbits": float(self.combo_stopbits.currentText()),
+            }
+
+    def _schedule_reconnect(self, reason: str) -> None:
+        if self._manual_disconnect:
+            return
+        if self._reconnect_in_progress:
+            return
+        self._reconnect_in_progress = True
+        self._set_connected_ui(False)
+        self.append_log("WARN", f"连接中断，准备自动重连：{reason}")
+        self._reconnect_timer.start(1500)
+
+    def _attempt_reconnect(self) -> None:
+        if not self._last_conn_params:
+            self._reconnect_in_progress = False
+            self.append_log("WARN", "缺少连接参数，无法自动重连。")
+            return
+        try:
+            self.append_log("INFO", "自动重连中...")
+            if self._last_conn_params.get("kind") == "TCP":
+                self._client.connect_tcp(
+                    str(self._last_conn_params["host"]),
+                    int(self._last_conn_params["port"]),
+                )
+            else:
+                self._client.connect_rtu(
+                    str(self._last_conn_params["port"]),
+                    int(self._last_conn_params["baudrate"]),
+                    int(self._last_conn_params["bytesize"]),
+                    str(self._last_conn_params["parity"]),
+                    float(self._last_conn_params["stopbits"]),
+                )
+            self._set_connected_ui(True)
+            self.append_log("OK", "自动重连成功。")
+            self._reconnect_in_progress = False
+        except Exception as exc:  # noqa: BLE001
+            self.append_log("WARN", f"自动重连失败，将继续重试：{self._format_user_exception(exc)}")
+            self._reconnect_timer.start(2000)
+
     def _perform_read_and_fill(self, log_tx_rx: bool, log_ok: bool) -> None:
         unit_id = int(self.spin_unit.value())
-        address = int(self.spin_addr.value())
-        count = int(self.spin_count.value())
         fc = self._current_fc()
         if fc not in ("03", "04"):
             raise RuntimeError("仅支持读保持/输入寄存器")
         name = "保持寄存器" if fc == "03" else "输入寄存器"
-        if log_tx_rx:
-            self.append_log(
-                "TX",
-                f"读取{name}：unit={unit_id}, address={address}, count={count}",
-            )
-        if fc == "03":
-            regs = self._client.read_holding_registers(unit_id, address, count)
+        batch_addrs = self._parse_batch_addresses()
+        self._batch_mode = bool(batch_addrs)
+        self._batch_addresses = list(batch_addrs)
+        if batch_addrs:
+            if log_tx_rx:
+                self.append_log(
+                    "TX",
+                    f"批量读取{name}：unit={unit_id}, addresses={batch_addrs}",
+                )
+            values_by_addr: Dict[int, int] = {}
+            for addr in batch_addrs:
+                try:
+                    values_by_addr[addr] = self._do_read_single_address(fc, unit_id, addr)
+                    self.append_log("RX", f"地址 {addr} 读取成功，值={values_by_addr[addr]}")
+                except Exception as exc:  # noqa: BLE001
+                    self.append_log("ERROR", f"地址 {addr} 读取失败：{self._format_user_exception(exc)}")
+                    if self._is_connection_like_error(exc):
+                        self._schedule_reconnect(str(exc))
+            self._fill_batch_table(values_by_addr)
         else:
-            regs = self._client.read_input_registers(unit_id, address, count)
-        if log_tx_rx:
-            self.append_log("RX", f"返回寄存器数量：{len(regs)}")
-        self._fill_table(address, regs)
+            address = int(self.spin_addr.value())
+            count = int(self.spin_count.value())
+            if log_tx_rx:
+                self.append_log(
+                    "TX",
+                    f"读取{name}：unit={unit_id}, address={address}, count={count}",
+                )
+            if fc == "03":
+                regs = self._client.read_holding_registers(unit_id, address, count)
+            else:
+                regs = self._client.read_input_registers(unit_id, address, count)
+            if log_tx_rx:
+                self.append_log("RX", f"返回寄存器数量：{len(regs)}")
+            self._fill_table(address, regs)
         if log_ok:
             self.append_log("OK", "操作完成")
 
@@ -732,6 +971,7 @@ class MainWindow(QWidget):
 
             if fc in ("03", "04"):
                 self._perform_read_and_fill(log_tx_rx=True, log_ok=True)
+                self._record_success()
 
             elif fc == "06":
                 value = self._parse_write_values_single(raw_values)
@@ -744,6 +984,7 @@ class MainWindow(QWidget):
                 self.append_log("RX", "写单个寄存器响应正常")
                 self._clear_result_table()
                 self.append_log("OK", "写入成功。")
+                self._record_success()
 
             elif fc == "16":
                 values = self._parse_write_values_multi(raw_values)
@@ -763,19 +1004,62 @@ class MainWindow(QWidget):
                 self.append_log("RX", f"写多个寄存器响应正常，共 {len(values)} 个寄存器")
                 self._clear_result_table()
                 self.append_log("OK", "写入成功。")
+                self._record_success()
             else:
                 self._show_error("内部错误", f"未知功能码: {fc}")
 
         except ValueError as exc:
+            self._record_failure(exc)
             self._show_error("参数错误", str(exc))
         except RuntimeError as exc:
+            self._record_failure(exc)
             self._show_error("执行失败", self._format_user_exception(exc))
+            if self._is_connection_like_error(exc):
+                self._schedule_reconnect(str(exc))
         except Exception as exc:  # noqa: BLE001
+            self._record_failure(exc)
             tb = traceback.format_exc()
             self.append_log("ERROR", f"未捕获异常:\n{tb}")
             self._show_error("执行失败", self._format_user_exception(exc))
+            if self._is_connection_like_error(exc):
+                self._schedule_reconnect(str(exc))
         finally:
             self._set_exec_busy(False)
+
+    def _on_read_once(self) -> None:
+        if self._current_fc() not in ("03", "04"):
+            self.append_log("WARN", "一键读取仅支持功能码 03 / 04。")
+            return
+        self.append_log("INFO", "触发一键读取。")
+        self._on_execute()
+
+    def _on_clear_result(self) -> None:
+        self._clear_result_table()
+        self.append_log("INFO", "已通过快捷按钮清空结果。")
+
+    def _on_reset_config(self) -> None:
+        self.edit_host.setText("127.0.0.1")
+        self.spin_port.setValue(502)
+        self.spin_baud.setValue(9600)
+        self.spin_bytesize.setCurrentText("8")
+        self.combo_parity.setCurrentText("N")
+        self.combo_stopbits.setCurrentText("1")
+        self.spin_unit.setValue(1)
+        self.spin_addr.setValue(0)
+        self.edit_batch_addrs.clear()
+        self.spin_count.setValue(10)
+        self.edit_values.clear()
+        self.spin_poll_interval.setValue(1000)
+        self.chk_poll.setChecked(False)
+        self.combo_fc.setCurrentIndex(0)
+        self.combo_dtype.setCurrentText("uint16")
+        self.combo_endian.setCurrentText("AB CD")
+        self._success_count = 0
+        self._failure_count = 0
+        self._timeout_count = 0
+        self._refresh_stats_labels()
+        self._clear_result_table()
+        self.append_log("INFO", "已重置配置为默认值。")
 
     # ------------------------------------------------------------------ 配置 / 日志 / CSV
     def _gather_config(self) -> dict:
@@ -793,6 +1077,7 @@ class MainWindow(QWidget):
             "unit_id": int(self.spin_unit.value()),
             "function_code": self._current_fc(),
             "start_address": int(self.spin_addr.value()),
+            "batch_addresses": self.edit_batch_addrs.text().strip(),
             "count": int(self.spin_count.value()),
             "data_type": self.combo_dtype.currentText(),
             "word_order": self.combo_endian.currentText(),
@@ -836,6 +1121,7 @@ class MainWindow(QWidget):
                 self.combo_fc.setCurrentIndex(idx)
                 break
         self.spin_addr.setValue(int(cfg.get("start_address", 0)))
+        self.edit_batch_addrs.setText(str(cfg.get("batch_addresses", "")))
         self.spin_count.setValue(int(cfg.get("count", 10)))
         dt = str(cfg.get("data_type", "uint16"))
         i = self.combo_dtype.findText(dt)

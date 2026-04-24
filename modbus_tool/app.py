@@ -10,7 +10,7 @@ from modbus_tool.ui.main_window import MainWindow
 def main() -> None:
     """启动 GUI 事件循环。"""
     app = QApplication(sys.argv)
-    app.setApplicationName("Modbus Studio V2")
+    app.setApplicationName("Modbus Studio V3")
     app.setOrganizationName("modbus-tool")
 
     window = MainWindow()
