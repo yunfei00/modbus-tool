@@ -8,12 +8,13 @@ from __future__ import annotations
 import csv
 import time
 import traceback
+from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional
 
 from PySide6.QtCore import Qt, QTimer
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QColor, QFont
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QCheckBox,
@@ -57,6 +58,14 @@ def _fmt_reg_bin(val: int) -> str:
     return "0b" + format(val & 0xFFFF, "016b")
 
 
+@dataclass
+class RegisterRowState:
+    address: int
+    current_value: int
+    write_value: int
+    status: str = "未修改"
+
+
 class MainWindow(QWidget):
     """Modbus Studio 主界面。"""
 
@@ -84,6 +93,8 @@ class MainWindow(QWidget):
         self._last_registers: Optional[List[int]] = None
         self._last_start_addr: int = 0
         self._last_values_by_addr: Dict[int, int] = {}
+        self._table_rows: List[RegisterRowState] = []
+        self._updating_table: bool = False
         self._batch_mode: bool = False
         self._batch_addresses: List[int] = []
         self._manual_disconnect: bool = False
@@ -358,17 +369,30 @@ class MainWindow(QWidget):
         self.combo_endian.addItems(["AB CD", "CD AB"])
         parse_row.addWidget(self.combo_endian)
         parse_row.addStretch()
+        self.btn_write_selected = QPushButton("写回选中行")
+        self.btn_write_all_modified = QPushButton("写回所有修改")
+        self.btn_reread = QPushButton("重新读取")
+        self.btn_clear_result_table = QPushButton("清空结果")
+        self.btn_write_all_modified.setStyleSheet("font-weight: 700;")
+        parse_row.addWidget(self.btn_write_selected)
+        parse_row.addWidget(self.btn_write_all_modified)
+        parse_row.addWidget(self.btn_reread)
+        parse_row.addWidget(self.btn_clear_result_table)
         self.btn_export_csv = QPushButton("导出 CSV")
         parse_row.addWidget(self.btn_export_csv)
         res_layout.addLayout(parse_row)
 
-        self.table = QTableWidget(0, 5)
+        self.table = QTableWidget(0, 7)
         self.table.setHorizontalHeaderLabels(
-            ["地址", "原始十进制", "原始十六进制", "二进制", "解析值"]
+            ["地址", "当前值(DEC)", "当前值(HEX)", "当前值(BIN)", "解析值", "写入值", "状态"]
         )
         header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.table.setEditTriggers(
+            QAbstractItemView.DoubleClicked
+            | QAbstractItemView.SelectedClicked
+            | QAbstractItemView.EditKeyPressed
+        )
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.table.setAlternatingRowColors(True)
@@ -424,6 +448,12 @@ class MainWindow(QWidget):
         self.btn_log_clear.clicked.connect(self._on_clear_log)
         self.btn_log_save.clicked.connect(self._on_save_log)
         self.btn_export_csv.clicked.connect(self._on_export_csv)
+        self.btn_write_selected.clicked.connect(self._on_write_selected_row)
+        self.btn_write_all_modified.clicked.connect(self._on_write_all_modified)
+        self.btn_reread.clicked.connect(self._on_reread)
+        self.btn_clear_result_table.clicked.connect(self._on_clear_result)
+        self.table.itemChanged.connect(self._on_table_item_changed)
+        self.table.itemSelectionChanged.connect(self._update_table_write_controls)
         self.btn_poll_start.clicked.connect(self._on_poll_start)
         self.btn_poll_stop.clicked.connect(self._on_poll_stop)
         self.chk_poll.stateChanged.connect(self._update_poll_controls_enabled)
@@ -583,6 +613,11 @@ class MainWindow(QWidget):
             self.edit_values.setPlaceholderText("请输入多个寄存器值，例如 1,2,3,4")
             self.edit_batch_addrs.clear()
             self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
+        self._updating_table = True
+        for row_idx in range(len(self._table_rows)):
+            self._refresh_table_row(row_idx)
+        self._updating_table = False
+        self._update_table_write_controls()
 
     def _update_poll_controls_enabled(self) -> None:
         fc_ok = self._current_fc() in ("03", "04")
@@ -597,6 +632,21 @@ class MainWindow(QWidget):
         self.btn_poll_start.setEnabled(can_start)
         self.btn_poll_stop.setEnabled(self._polling_active and fc_ok)
 
+    def _update_table_write_controls(self) -> None:
+        is_holding_read = self._current_fc() == "03"
+        has_rows = self.table.rowCount() > 0
+        has_selection = bool(self.table.selectionModel() and self.table.selectionModel().selectedRows())
+        pending_count = sum(1 for row in self._table_rows if row.status == "待写入")
+        self.btn_write_selected.setEnabled(is_holding_read and has_rows and has_selection)
+        self.btn_write_all_modified.setEnabled(is_holding_read and pending_count > 0)
+        self.btn_reread.setEnabled(has_rows and self._current_fc() in ("03", "04"))
+        if not is_holding_read:
+            self.btn_write_selected.setToolTip("仅功能码 03 结果支持表格写回")
+            self.btn_write_all_modified.setToolTip("仅功能码 03 结果支持表格写回")
+        else:
+            self.btn_write_selected.setToolTip("")
+            self.btn_write_all_modified.setToolTip("")
+
     def _set_connected_ui(self, connected: bool) -> None:
         self.btn_connect.setEnabled(not connected)
         self.btn_disconnect.setEnabled(connected)
@@ -606,6 +656,7 @@ class MainWindow(QWidget):
         self.btn_refresh_ports.setEnabled(not connected)
         self._set_connection_status(connected)
         self._update_poll_controls_enabled()
+        self._update_table_write_controls()
 
     def _stop_polling_internal(self, silent: bool = False) -> None:
         was_active = self._polling_active
@@ -738,53 +789,156 @@ class MainWindow(QWidget):
             self.table.setItem(row, 4, QTableWidgetItem(parsed[row]))
 
     def _clear_result_table(self) -> None:
+        self._updating_table = True
         self.table.setRowCount(0)
+        self._updating_table = False
         self._last_registers = None
         self._last_values_by_addr.clear()
+        self._table_rows.clear()
         self.append_log("INFO", "结果表暂无数据，请执行读取操作。")
+        self._update_table_write_controls()
+
+    def _set_table_item(self, row: int, col: int, text: str, editable: bool = False) -> None:
+        item = QTableWidgetItem(text)
+        flags = Qt.ItemIsSelectable | Qt.ItemIsEnabled
+        if editable:
+            flags |= Qt.ItemIsEditable
+            item.setBackground(QColor("#FFF8E1"))
+        item.setFlags(flags)
+        self.table.setItem(row, col, item)
+
+    def _status_text(self, row: RegisterRowState, edited: bool = False) -> str:
+        if row.status == "写入失败":
+            return "写入失败"
+        if row.status == "写入成功":
+            return "写入成功"
+        if edited or row.write_value != row.current_value:
+            return "待写入"
+        return "未修改"
+
+    def _refresh_table_row(self, row_index: int) -> None:
+        if row_index >= len(self._table_rows):
+            return
+        row = self._table_rows[row_index]
+        self._set_table_item(row_index, 0, str(row.address))
+        self._set_table_item(row_index, 1, str(row.current_value))
+        self._set_table_item(row_index, 2, _fmt_reg_hex(row.current_value))
+        self._set_table_item(row_index, 3, _fmt_reg_bin(row.current_value))
+        self._set_table_item(row_index, 4, "")
+        self._set_table_item(row_index, 5, str(row.write_value), editable=self._current_fc() == "03")
+        self._set_table_item(row_index, 6, row.status)
 
     def _fill_table(self, start_addr: int, registers: List[int]) -> None:
         self._last_start_addr = start_addr
         self._last_registers = list(registers)
+        self._table_rows = []
+        self._updating_table = True
         self.table.setRowCount(0)
         for i, val in enumerate(registers):
             row = self.table.rowCount()
             self.table.insertRow(row)
             addr = start_addr + i
-            self.table.setItem(row, 0, QTableWidgetItem(str(addr)))
-            self.table.setItem(row, 1, QTableWidgetItem(str(val)))
-            self.table.setItem(row, 2, QTableWidgetItem(_fmt_reg_hex(val)))
-            self.table.setItem(row, 3, QTableWidgetItem(_fmt_reg_bin(val)))
-            self.table.setItem(row, 4, QTableWidgetItem(""))
+            row_state = RegisterRowState(address=addr, current_value=val, write_value=val)
+            self._table_rows.append(row_state)
+            self._refresh_table_row(row)
             self._last_values_by_addr[addr] = val
+        self._updating_table = False
         self._apply_parsed_column()
+        self._update_table_write_controls()
 
     def _fill_batch_table(self, values_by_addr: Dict[int, int]) -> None:
+        self._updating_table = True
         self.table.setRowCount(0)
         self._last_registers = list(values_by_addr.values())
+        self._table_rows = []
         for addr in sorted(values_by_addr.keys()):
             val = values_by_addr[addr]
             prev = self._last_values_by_addr.get(addr)
             row = self.table.rowCount()
             self.table.insertRow(row)
-            addr_item = QTableWidgetItem(str(addr))
-            val_item = QTableWidgetItem(str(val))
-            hex_item = QTableWidgetItem(_fmt_reg_hex(val))
-            bin_item = QTableWidgetItem(_fmt_reg_bin(val))
-            parsed_item = QTableWidgetItem(str(val))
+            row_state = RegisterRowState(address=addr, current_value=val, write_value=val)
+            self._table_rows.append(row_state)
+            self._refresh_table_row(row)
+            parsed_item = self.table.item(row, 4)
             if prev is not None and val != prev:
-                for item in (val_item, hex_item, bin_item, parsed_item):
+                for item in (
+                    self.table.item(row, 1),
+                    self.table.item(row, 2),
+                    self.table.item(row, 3),
+                    parsed_item,
+                ):
                     item.setForeground(Qt.GlobalColor.red if val > prev else Qt.GlobalColor.blue)
                 self.append_log(
                     "INFO",
                     f"地址 {addr} 数值变化：{prev} -> {val}（{'变大' if val > prev else '变小'}）",
                 )
-            self.table.setItem(row, 0, addr_item)
-            self.table.setItem(row, 1, val_item)
-            self.table.setItem(row, 2, hex_item)
-            self.table.setItem(row, 3, bin_item)
-            self.table.setItem(row, 4, parsed_item)
             self._last_values_by_addr[addr] = val
+        self._updating_table = False
+        self._update_table_write_controls()
+
+    def _on_table_item_changed(self, item: QTableWidgetItem) -> None:
+        if self._updating_table:
+            return
+        row = item.row()
+        col = item.column()
+        if col != 5 or row >= len(self._table_rows):
+            return
+        row_state = self._table_rows[row]
+        old_value = row_state.write_value
+        raw = (item.text() or "").strip()
+        try:
+            new_value = int(raw, 10)
+        except ValueError:
+            self._show_warning("输入错误", "写入值必须是整数，范围 0~65535。")
+            self._updating_table = True
+            item.setText(str(old_value))
+            self._updating_table = False
+            return
+        if not 0 <= new_value <= 65535:
+            self._show_warning("输入错误", "写入值必须在 0~65535 范围内。")
+            self._updating_table = True
+            item.setText(str(old_value))
+            self._updating_table = False
+            return
+        row_state.write_value = new_value
+        row_state.status = self._status_text(row_state, edited=True)
+        self._updating_table = True
+        self.table.item(row, 6).setText(row_state.status)
+        self._updating_table = False
+        self._update_table_write_controls()
+
+    def _read_addresses_holding(self, addresses: List[int]) -> Dict[int, int]:
+        if not addresses:
+            return {}
+        unit_id = int(self.spin_unit.value())
+        result: Dict[int, int] = {}
+        sorted_addrs = sorted(addresses)
+        if sorted_addrs == list(range(sorted_addrs[0], sorted_addrs[-1] + 1)):
+            start = sorted_addrs[0]
+            count = len(sorted_addrs)
+            regs = self._client.read_holding_registers(unit_id, start, count)
+            for idx, value in enumerate(regs):
+                result[start + idx] = value
+            return result
+        for addr in sorted_addrs:
+            result[addr] = self._client.read_holding_registers(unit_id, addr, 1)[0]
+        return result
+
+    def _sync_rows_after_reread(self, values_by_addr: Dict[int, int]) -> None:
+        self._updating_table = True
+        for idx, row_state in enumerate(self._table_rows):
+            if row_state.address not in values_by_addr:
+                continue
+            row_state.current_value = values_by_addr[row_state.address]
+            if row_state.status != "待写入":
+                row_state.write_value = row_state.current_value
+                row_state.status = "未修改"
+            self._refresh_table_row(idx)
+            self._last_values_by_addr[row_state.address] = row_state.current_value
+        self._updating_table = False
+        self._last_registers = [row.current_value for row in self._table_rows]
+        self._apply_parsed_column()
+        self._update_table_write_controls()
 
     # ------------------------------------------------------------------ 读 / 执行
     def _parse_batch_addresses(self) -> List[int]:
@@ -1032,6 +1186,178 @@ class MainWindow(QWidget):
             return
         self.append_log("INFO", "触发一键读取。")
         self._on_execute()
+
+    def _on_reread(self) -> None:
+        if not self._client.is_connected():
+            self._warn_not_connected_execute()
+            return
+        if self._current_fc() not in ("03", "04"):
+            self._show_warning("重新读取", "当前功能码不支持重新读取。")
+            return
+        if not self._table_rows:
+            self._show_warning("重新读取", "结果表暂无数据。")
+            return
+        try:
+            unit_id = int(self.spin_unit.value())
+            fc = self._current_fc()
+            values_by_addr: Dict[int, int] = {}
+            batch_addrs = self._parse_batch_addresses()
+            if batch_addrs:
+                self.append_log("TX", f"重新读取批量地址：{batch_addrs}")
+                for addr in batch_addrs:
+                    if fc == "03":
+                        values_by_addr[addr] = self._client.read_holding_registers(unit_id, addr, 1)[0]
+                    else:
+                        values_by_addr[addr] = self._client.read_input_registers(unit_id, addr, 1)[0]
+            else:
+                start = int(self.spin_addr.value())
+                count = int(self.spin_count.value())
+                self.append_log("TX", f"重新读取范围：address={start}, count={count}")
+                if fc == "03":
+                    regs = self._client.read_holding_registers(unit_id, start, count)
+                else:
+                    regs = self._client.read_input_registers(unit_id, start, count)
+                for idx, reg in enumerate(regs):
+                    values_by_addr[start + idx] = reg
+            self._sync_rows_after_reread(values_by_addr)
+            self.append_log("OK", "重新读取完成。")
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("重新读取失败", self._format_user_exception(exc))
+
+    def _on_write_selected_row(self) -> None:
+        if self._current_fc() != "03":
+            self._show_warning("写回", "仅功能码 03 结果支持写回。")
+            return
+        if not self._client.is_connected():
+            self._warn_not_connected_execute()
+            return
+        selected = self.table.selectionModel().selectedRows() if self.table.selectionModel() else []
+        if not selected:
+            self._show_warning("写回选中行", "请先选中一行。")
+            return
+        row_idx = selected[0].row()
+        row_state = self._table_rows[row_idx]
+        ok = QMessageBox.question(
+            self,
+            "确认写入",
+            "确认写入当前选中寄存器？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if ok != QMessageBox.Yes:
+            return
+        unit_id = int(self.spin_unit.value())
+        expected = row_state.write_value
+        addr = row_state.address
+        try:
+            self.append_log("TX", f"写单寄存器：address={addr}, value={expected}")
+            self._client.write_single_register(unit_id, addr, expected)
+            self.append_log("OK", f"写入成功：address={addr}")
+            actual = self._client.read_holding_registers(unit_id, addr, 1)[0]
+            self.append_log("RX", f"重读校验：address={addr}, value={actual}")
+            row_state.current_value = actual
+            if actual == expected:
+                row_state.status = "写入成功"
+            else:
+                row_state.status = "写入失败"
+                self.append_log(
+                    "ERROR",
+                    f"写入失败：address={addr}, expected={expected}, actual={actual}",
+                )
+            row_state.write_value = expected
+            self._updating_table = True
+            self._refresh_table_row(row_idx)
+            self._updating_table = False
+            self._apply_parsed_column()
+            self._update_table_write_controls()
+        except Exception as exc:  # noqa: BLE001
+            row_state.status = "写入失败"
+            self._updating_table = True
+            self.table.item(row_idx, 6).setText("写入失败")
+            self._updating_table = False
+            self.append_log("ERROR", f"写入失败：address={addr}, reason={self._format_user_exception(exc)}")
+            self._show_error("写回失败", self._format_user_exception(exc))
+
+    def _on_write_all_modified(self) -> None:
+        if self._current_fc() != "03":
+            self._show_warning("批量写回", "仅功能码 03 结果支持写回。")
+            return
+        if not self._client.is_connected():
+            self._warn_not_connected_execute()
+            return
+        pending_rows = [row for row in self._table_rows if row.status == "待写入"]
+        if not pending_rows:
+            self._show_warning("批量写回", "没有待写入的寄存器。")
+            return
+        confirm = QMessageBox.question(
+            self,
+            "确认写入",
+            f"确认写入 {len(pending_rows)} 个已修改寄存器？",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if confirm != QMessageBox.Yes:
+            return
+
+        unit_id = int(self.spin_unit.value())
+        pending_rows.sort(key=lambda x: x.address)
+        groups: List[List[RegisterRowState]] = []
+        for row in pending_rows:
+            if not groups or row.address != groups[-1][-1].address + 1:
+                groups.append([row])
+            else:
+                groups[-1].append(row)
+
+        touched_addrs = [row.address for row in pending_rows]
+        for group in groups:
+            try:
+                if len(group) > 1:
+                    start = group[0].address
+                    values = [r.write_value for r in group]
+                    self.append_log(
+                        "TX",
+                        f"批量写寄存器：address={start}, count={len(values)}, values={values}",
+                    )
+                    self._client.write_multiple_registers(unit_id, start, values)
+                    self.append_log("OK", f"批量写入成功：start={start}, count={len(values)}")
+                else:
+                    row = group[0]
+                    self.append_log("TX", f"写单寄存器：address={row.address}, value={row.write_value}")
+                    self._client.write_single_register(unit_id, row.address, row.write_value)
+                    self.append_log("OK", f"写入成功：address={row.address}")
+            except Exception as exc:  # noqa: BLE001
+                for row in group:
+                    row.status = "写入失败"
+                self.append_log("ERROR", f"写入失败：{self._format_user_exception(exc)}")
+
+        try:
+            verify_map = self._read_addresses_holding([row.address for row in self._table_rows])
+            for row in self._table_rows:
+                if row.address in verify_map:
+                    row.current_value = verify_map[row.address]
+                    self._last_values_by_addr[row.address] = row.current_value
+                    if row.address in touched_addrs:
+                        self.append_log(
+                            "RX",
+                            f"重读校验：address={row.address}, value={row.current_value}",
+                        )
+                        if row.current_value == row.write_value:
+                            row.status = "写入成功"
+                        else:
+                            row.status = "写入失败"
+                            self.append_log(
+                                "ERROR",
+                                f"写入失败：address={row.address}, expected={row.write_value}, actual={row.current_value}",
+                            )
+            self._updating_table = True
+            for idx in range(len(self._table_rows)):
+                self._refresh_table_row(idx)
+            self._updating_table = False
+            self._last_registers = [row.current_value for row in self._table_rows]
+            self._apply_parsed_column()
+            self._update_table_write_controls()
+        except Exception as exc:  # noqa: BLE001
+            self._show_error("重读校验失败", self._format_user_exception(exc))
 
     def _on_clear_result(self) -> None:
         self._clear_result_table()
