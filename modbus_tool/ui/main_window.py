@@ -371,6 +371,14 @@ class MainWindow(QWidget):
         self.combo_endian.addItems(["AB CD", "CD AB"])
         parse_row.addWidget(self.combo_endian)
         parse_row.addStretch()
+        parse_row.addWidget(QLabel("写回方式:"))
+        self.combo_table_write_fc = QComboBox()
+        self.combo_table_write_fc.addItem("06 单寄存器", userData="06")
+        self.combo_table_write_fc.addItem("16 多寄存器", userData="16")
+        self.combo_table_write_fc.addItem("05 单线圈", userData="05")
+        self.combo_table_write_fc.addItem("0F 多线圈", userData="0F")
+        self.combo_table_write_fc.setToolTip("仅作用于结果表「写回选中行 / 写回所有修改」按钮。")
+        parse_row.addWidget(self.combo_table_write_fc)
         self.btn_write_selected = QPushButton("写回选中行")
         self.btn_write_all_modified = QPushButton("写回所有修改")
         self.btn_reread = QPushButton("重新读取")
@@ -452,6 +460,7 @@ class MainWindow(QWidget):
         self.btn_export_csv.clicked.connect(self._on_export_csv)
         self.btn_write_selected.clicked.connect(self._on_write_selected_row)
         self.btn_write_all_modified.clicked.connect(self._on_write_all_modified)
+        self.combo_table_write_fc.currentIndexChanged.connect(self._update_table_write_controls)
         self.btn_reread.clicked.connect(self._on_reread)
         self.btn_clear_result_table.clicked.connect(self._on_clear_result)
         self.table.itemChanged.connect(self._on_table_item_changed)
@@ -647,15 +656,35 @@ class MainWindow(QWidget):
         has_rows = self.table.rowCount() > 0
         has_selection = bool(self.table.selectionModel() and self.table.selectionModel().selectedRows())
         pending_count = sum(1 for row in self._table_rows if row.status == "待写入")
-        self.btn_write_selected.setEnabled(is_holding_read and has_rows and has_selection)
-        self.btn_write_all_modified.setEnabled(is_holding_read and pending_count > 0)
+        mode = self._current_table_write_fc()
+        coil_mode = mode in ("05", "0F")
+        coil_values_ok = all(row.write_value in (0, 1) for row in self._table_rows)
+        can_write_table = is_holding_read and (not coil_mode or coil_values_ok)
+        self.btn_write_selected.setEnabled(can_write_table and has_rows and has_selection)
+        self.btn_write_all_modified.setEnabled(can_write_table and pending_count > 0)
+        self.combo_table_write_fc.setEnabled(is_holding_read and has_rows)
         self.btn_reread.setEnabled(has_rows and self._current_fc() in ("03", "04"))
         if not is_holding_read:
             self.btn_write_selected.setToolTip("仅功能码 03 结果支持表格写回")
             self.btn_write_all_modified.setToolTip("仅功能码 03 结果支持表格写回")
+            self.combo_table_write_fc.setToolTip("仅功能码 03 结果支持表格写回。")
+        elif coil_mode and not coil_values_ok:
+            tip = "05/0F 线圈写回要求写入值仅能为 0 或 1。"
+            self.btn_write_selected.setToolTip(tip)
+            self.btn_write_all_modified.setToolTip(tip)
+            self.combo_table_write_fc.setToolTip(tip)
         else:
             self.btn_write_selected.setToolTip("")
             self.btn_write_all_modified.setToolTip("")
+            self.combo_table_write_fc.setToolTip("仅作用于结果表「写回选中行 / 写回所有修改」按钮。")
+
+    def _current_table_write_fc(self) -> str:
+        return str(self.combo_table_write_fc.currentData())
+
+    def _assert_coil_write_value(self, value: int) -> bool:
+        if value not in (0, 1):
+            raise ValueError("05/0F 写回要求写入值只能为 0 或 1。")
+        return bool(value)
 
     def _set_connected_ui(self, connected: bool) -> None:
         self.btn_connect.setEnabled(not connected)
@@ -1311,11 +1340,21 @@ class MainWindow(QWidget):
         unit_id = int(self.spin_unit.value())
         expected = row_state.write_value
         addr = row_state.address
+        mode = self._current_table_write_fc()
         try:
-            self.append_log("TX", f"写单寄存器：address={addr}, value={expected}")
-            self._client.write_single_register(unit_id, addr, expected)
+            if mode == "05":
+                coil_value = self._assert_coil_write_value(expected)
+                self.append_log("TX", f"05 写单线圈：address={addr}, value={int(coil_value)}")
+                self._client.write_single_coil(unit_id, addr, coil_value)
+            elif mode == "0F":
+                coil_value = self._assert_coil_write_value(expected)
+                self.append_log("TX", f"0F 写多线圈(单值)：address={addr}, values={[int(coil_value)]}")
+                self._client.write_multiple_coils(unit_id, addr, [coil_value])
+            else:
+                self.append_log("TX", f"写单寄存器：address={addr}, value={expected}")
+                self._client.write_single_register(unit_id, addr, expected)
             self.append_log("OK", f"写入成功：address={addr}")
-            actual = self._client.read_holding_registers(unit_id, addr, 1)[0]
+            actual = expected if mode in ("05", "0F") else self._client.read_holding_registers(unit_id, addr, 1)[0]
             self.append_log("RX", f"重读校验：address={addr}, value={actual}")
             row_state.current_value = actual
             if actual == expected:
@@ -1362,6 +1401,7 @@ class MainWindow(QWidget):
             return
 
         unit_id = int(self.spin_unit.value())
+        mode = self._current_table_write_fc()
         pending_rows.sort(key=lambda x: x.address)
         groups: List[List[RegisterRowState]] = []
         for row in pending_rows:
@@ -1373,7 +1413,22 @@ class MainWindow(QWidget):
         touched_addrs = [row.address for row in pending_rows]
         for group in groups:
             try:
-                if len(group) > 1:
+                if mode == "05":
+                    row = group[0]
+                    coil_value = self._assert_coil_write_value(row.write_value)
+                    self.append_log("TX", f"05 写单线圈：address={row.address}, value={int(coil_value)}")
+                    self._client.write_single_coil(unit_id, row.address, coil_value)
+                    self.append_log("OK", f"写入成功：address={row.address}")
+                elif mode == "0F" and len(group) > 1:
+                    start = group[0].address
+                    values = [self._assert_coil_write_value(r.write_value) for r in group]
+                    self.append_log(
+                        "TX",
+                        f"0F 批量写线圈：address={start}, count={len(values)}, values={[int(v) for v in values]}",
+                    )
+                    self._client.write_multiple_coils(unit_id, start, values)
+                    self.append_log("OK", f"批量写入成功：start={start}, count={len(values)}")
+                elif mode in ("0F", "16") and len(group) > 1:
                     start = group[0].address
                     values = [r.write_value for r in group]
                     self.append_log(
@@ -1384,8 +1439,16 @@ class MainWindow(QWidget):
                     self.append_log("OK", f"批量写入成功：start={start}, count={len(values)}")
                 else:
                     row = group[0]
-                    self.append_log("TX", f"写单寄存器：address={row.address}, value={row.write_value}")
-                    self._client.write_single_register(unit_id, row.address, row.write_value)
+                    if mode == "0F":
+                        coil_value = self._assert_coil_write_value(row.write_value)
+                        self.append_log(
+                            "TX",
+                            f"0F 写多线圈(单值)：address={row.address}, values={[int(coil_value)]}",
+                        )
+                        self._client.write_multiple_coils(unit_id, row.address, [coil_value])
+                    else:
+                        self.append_log("TX", f"写单寄存器：address={row.address}, value={row.write_value}")
+                        self._client.write_single_register(unit_id, row.address, row.write_value)
                     self.append_log("OK", f"写入成功：address={row.address}")
             except Exception as exc:  # noqa: BLE001
                 for row in group:
@@ -1393,24 +1456,35 @@ class MainWindow(QWidget):
                 self.append_log("ERROR", f"写入失败：{self._format_user_exception(exc)}")
 
         try:
-            verify_map = self._read_addresses_holding([row.address for row in self._table_rows])
-            for row in self._table_rows:
-                if row.address in verify_map:
-                    row.current_value = verify_map[row.address]
-                    self._last_values_by_addr[row.address] = row.current_value
+            if mode in ("05", "0F"):
+                for row in self._table_rows:
                     if row.address in touched_addrs:
+                        row.current_value = row.write_value
+                        row.status = "写入成功"
+                        self._last_values_by_addr[row.address] = row.current_value
                         self.append_log(
                             "RX",
-                            f"重读校验：address={row.address}, value={row.current_value}",
+                            f"线圈写回完成（未重读寄存器校验）：address={row.address}, value={row.current_value}",
                         )
-                        if row.current_value == row.write_value:
-                            row.status = "写入成功"
-                        else:
-                            row.status = "写入失败"
+            else:
+                verify_map = self._read_addresses_holding([row.address for row in self._table_rows])
+                for row in self._table_rows:
+                    if row.address in verify_map:
+                        row.current_value = verify_map[row.address]
+                        self._last_values_by_addr[row.address] = row.current_value
+                        if row.address in touched_addrs:
                             self.append_log(
-                                "ERROR",
-                                f"写入失败：address={row.address}, expected={row.write_value}, actual={row.current_value}",
+                                "RX",
+                                f"重读校验：address={row.address}, value={row.current_value}",
                             )
+                            if row.current_value == row.write_value:
+                                row.status = "写入成功"
+                            else:
+                                row.status = "写入失败"
+                                self.append_log(
+                                    "ERROR",
+                                    f"写入失败：address={row.address}, expected={row.write_value}, actual={row.current_value}",
+                                )
             self._updating_table = True
             for idx in range(len(self._table_rows)):
                 self._refresh_table_row(idx)
