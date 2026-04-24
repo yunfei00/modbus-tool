@@ -6,6 +6,7 @@
 from __future__ import annotations
 
 import csv
+import re
 import time
 import traceback
 from dataclasses import dataclass
@@ -625,7 +626,7 @@ class MainWindow(QWidget):
             self.edit_batch_addrs.clear()
             self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
         elif fc == "0F":
-            self.edit_values.setPlaceholderText("请输入多个线圈值，例如 1,0,1 或 true,false,true")
+            self.edit_values.setPlaceholderText("请输入多个线圈值，例如 1,0,1 或 1 0 1（支持逗号/空格分隔）")
             self.edit_batch_addrs.clear()
             self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
         else:
@@ -1120,12 +1121,9 @@ class MainWindow(QWidget):
         return v
 
     def _parse_write_values_multi(self, text: str) -> list[int]:
-        s = text.strip()
-        if not s:
-            raise ValueError("写入值不能为空。")
-        parts = [p.strip() for p in s.split(",") if p.strip()]
+        parts = self._split_multi_values(text)
         if not parts:
-            raise ValueError("请使用英文逗号分隔多个整数，例如: 1,2,3")
+            raise ValueError("写入值不能为空。")
         values: list[int] = []
         for p in parts:
             try:
@@ -1149,13 +1147,16 @@ class MainWindow(QWidget):
             return False
         raise ValueError("线圈值仅支持 1/0、true/false、on/off、yes/no。")
 
-    def _parse_coil_values_multi(self, text: str) -> list[bool]:
+    def _split_multi_values(self, text: str) -> list[str]:
         s = text.strip()
         if not s:
-            raise ValueError("线圈写入值不能为空。")
-        parts = [p.strip() for p in s.split(",") if p.strip()]
+            return []
+        return [part for part in re.split(r"[\s,，]+", s) if part]
+
+    def _parse_coil_values_multi(self, text: str) -> list[bool]:
+        parts = self._split_multi_values(text)
         if not parts:
-            raise ValueError("请使用英文逗号分隔多个线圈值，例如: 1,0,1")
+            raise ValueError("线圈写入值不能为空。")
         return [self._parse_coil_value(p) for p in parts]
 
     def _format_user_exception(self, exc: BaseException, context: str = "") -> str:
@@ -1410,15 +1411,17 @@ class MainWindow(QWidget):
             else:
                 groups[-1].append(row)
 
-        touched_addrs = [row.address for row in pending_rows]
+        touched_addrs = {row.address for row in pending_rows}
+        success_addrs: set[int] = set()
         for group in groups:
             try:
                 if mode == "05":
-                    row = group[0]
-                    coil_value = self._assert_coil_write_value(row.write_value)
-                    self.append_log("TX", f"05 写单线圈：address={row.address}, value={int(coil_value)}")
-                    self._client.write_single_coil(unit_id, row.address, coil_value)
-                    self.append_log("OK", f"写入成功：address={row.address}")
+                    for row in group:
+                        coil_value = self._assert_coil_write_value(row.write_value)
+                        self.append_log("TX", f"05 写单线圈：address={row.address}, value={int(coil_value)}")
+                        self._client.write_single_coil(unit_id, row.address, coil_value)
+                        success_addrs.add(row.address)
+                        self.append_log("OK", f"写入成功：address={row.address}")
                 elif mode == "0F" and len(group) > 1:
                     start = group[0].address
                     values = [self._assert_coil_write_value(r.write_value) for r in group]
@@ -1427,6 +1430,7 @@ class MainWindow(QWidget):
                         f"0F 批量写线圈：address={start}, count={len(values)}, values={[int(v) for v in values]}",
                     )
                     self._client.write_multiple_coils(unit_id, start, values)
+                    success_addrs.update(r.address for r in group)
                     self.append_log("OK", f"批量写入成功：start={start}, count={len(values)}")
                 elif mode in ("0F", "16") and len(group) > 1:
                     start = group[0].address
@@ -1436,6 +1440,7 @@ class MainWindow(QWidget):
                         f"批量写寄存器：address={start}, count={len(values)}, values={values}",
                     )
                     self._client.write_multiple_registers(unit_id, start, values)
+                    success_addrs.update(r.address for r in group)
                     self.append_log("OK", f"批量写入成功：start={start}, count={len(values)}")
                 else:
                     row = group[0]
@@ -1449,6 +1454,7 @@ class MainWindow(QWidget):
                     else:
                         self.append_log("TX", f"写单寄存器：address={row.address}, value={row.write_value}")
                         self._client.write_single_register(unit_id, row.address, row.write_value)
+                    success_addrs.add(row.address)
                     self.append_log("OK", f"写入成功：address={row.address}")
             except Exception as exc:  # noqa: BLE001
                 for row in group:
@@ -1458,7 +1464,7 @@ class MainWindow(QWidget):
         try:
             if mode in ("05", "0F"):
                 for row in self._table_rows:
-                    if row.address in touched_addrs:
+                    if row.address in success_addrs:
                         row.current_value = row.write_value
                         row.status = "写入成功"
                         self._last_values_by_addr[row.address] = row.current_value
@@ -1466,6 +1472,8 @@ class MainWindow(QWidget):
                             "RX",
                             f"线圈写回完成（未重读寄存器校验）：address={row.address}, value={row.current_value}",
                         )
+                    elif row.address in touched_addrs and row.status != "写入失败":
+                        row.status = "写入失败"
             else:
                 verify_map = self._read_addresses_holding([row.address for row in self._table_rows])
                 for row in self._table_rows:
