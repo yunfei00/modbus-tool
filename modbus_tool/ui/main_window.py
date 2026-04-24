@@ -72,7 +72,9 @@ class MainWindow(QWidget):
     FC_OPTIONS = (
         ("03", "03 Read Holding Registers"),
         ("04", "04 Read Input Registers"),
+        ("05", "05 Write Single Coil"),
         ("06", "06 Write Single Register"),
+        ("0F", "0F Write Multiple Coils"),
         ("16", "16 Write Multiple Registers"),
     )
 
@@ -589,8 +591,8 @@ class MainWindow(QWidget):
     def _update_fc_dependent_widgets(self) -> None:
         fc = self._current_fc()
         is_read = fc in ("03", "04")
-        is_single = fc == "06"
-        is_multi = fc == "16"
+        is_single = fc in ("05", "06")
+        is_multi = fc in ("0F", "16")
 
         if is_single:
             self.spin_count.setValue(1)
@@ -605,8 +607,16 @@ class MainWindow(QWidget):
             self.edit_values.clear()
             self.edit_values.setPlaceholderText("读操作无需填写写入值")
             self.edit_batch_addrs.setPlaceholderText("可选：批量地址，例如 0,1,5,10")
-        elif is_single:
+        elif fc == "05":
+            self.edit_values.setPlaceholderText("请输入线圈值，例如 1/0、true/false、on/off")
+            self.edit_batch_addrs.clear()
+            self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
+        elif fc == "06":
             self.edit_values.setPlaceholderText("请输入单个寄存器值，例如 123")
+            self.edit_batch_addrs.clear()
+            self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
+        elif fc == "0F":
+            self.edit_values.setPlaceholderText("请输入多个线圈值，例如 1,0,1 或 true,false,true")
             self.edit_batch_addrs.clear()
             self.edit_batch_addrs.setPlaceholderText("仅读操作支持批量地址")
         else:
@@ -1098,6 +1108,27 @@ class MainWindow(QWidget):
             values.append(v)
         return values
 
+    def _parse_coil_value(self, text: str) -> bool:
+        s = text.strip().lower()
+        if not s:
+            raise ValueError("线圈写入值不能为空。")
+        truthy = {"1", "true", "on", "yes"}
+        falsy = {"0", "false", "off", "no"}
+        if s in truthy:
+            return True
+        if s in falsy:
+            return False
+        raise ValueError("线圈值仅支持 1/0、true/false、on/off、yes/no。")
+
+    def _parse_coil_values_multi(self, text: str) -> list[bool]:
+        s = text.strip()
+        if not s:
+            raise ValueError("线圈写入值不能为空。")
+        parts = [p.strip() for p in s.split(",") if p.strip()]
+        if not parts:
+            raise ValueError("请使用英文逗号分隔多个线圈值，例如: 1,0,1")
+        return [self._parse_coil_value(p) for p in parts]
+
     def _format_user_exception(self, exc: BaseException, context: str = "") -> str:
         text = str(exc).strip() or type(exc).__name__
         lower = text.lower()
@@ -1127,6 +1158,18 @@ class MainWindow(QWidget):
                 self._perform_read_and_fill(log_tx_rx=True, log_ok=True)
                 self._record_success()
 
+            elif fc == "05":
+                value = self._parse_coil_value(raw_values)
+                self.append_log(
+                    "TX",
+                    f"写单个线圈：unit={unit_id}, address={address}, value={int(value)}",
+                )
+                self._client.write_single_coil(unit_id, address, value)
+                self.append_log("RX", "写单个线圈响应正常")
+                self._clear_result_table()
+                self.append_log("OK", "写入成功。")
+                self._record_success()
+
             elif fc == "06":
                 value = self._parse_write_values_single(raw_values)
                 self.append_log(
@@ -1136,6 +1179,25 @@ class MainWindow(QWidget):
                 )
                 self._client.write_single_register(unit_id, address, value)
                 self.append_log("RX", "写单个寄存器响应正常")
+                self._clear_result_table()
+                self.append_log("OK", "写入成功。")
+                self._record_success()
+
+            elif fc == "0F":
+                values = self._parse_coil_values_multi(raw_values)
+                if count != len(values):
+                    self._show_error(
+                        "参数错误",
+                        f"功能码 0F 要求「数量」与写入值个数一致："
+                        f"当前数量={count}，写入值个数={len(values)}。",
+                    )
+                    return
+                self.append_log(
+                    "TX",
+                    f"写多个线圈：unit={unit_id}, address={address}, count={len(values)}",
+                )
+                self._client.write_multiple_coils(unit_id, address, values)
+                self.append_log("RX", f"写多个线圈响应正常，共 {len(values)} 个线圈")
                 self._clear_result_table()
                 self.append_log("OK", "写入成功。")
                 self._record_success()
