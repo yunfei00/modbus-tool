@@ -72,6 +72,18 @@ class ModbusClient:
         client = self._require_client()
         return client.write_registers(address, values, **unit_kw)
 
+    def _call_pymodbus_write_coil(self, address: int, value: bool, unit_kw: dict[str, Any]) -> Any:
+        """调用 pymodbus 的 write_coil。"""
+        client = self._require_client()
+        return client.write_coil(address, value, **unit_kw)
+
+    def _call_pymodbus_write_coils(
+        self, address: int, values: list[bool], unit_kw: dict[str, Any]
+    ) -> Any:
+        """调用 pymodbus 的 write_coils。"""
+        client = self._require_client()
+        return client.write_coils(address, values, **unit_kw)
+
     # ------------------------------------------------------------------ 连接
     def connect_tcp(self, host: str, port: int) -> None:
         """
@@ -186,6 +198,26 @@ class ModbusClient:
         unit_kw = _unit_kwargs(unit_id)
         try:
             resp = self._call_pymodbus_write_registers(address, values, unit_kw)
+        except (ModbusIOException, ConnectionException, ModbusException) as exc:
+            raise RuntimeError(f"通讯异常: {exc}") from exc
+        if resp.isError():
+            raise RuntimeError(f"Modbus 异常响应: {_format_modbus_error(resp)}")
+
+    def write_single_coil(self, unit_id: int, address: int, value: bool) -> None:
+        """功能码 05：写单个线圈。"""
+        unit_kw = _unit_kwargs(unit_id)
+        try:
+            resp = self._call_pymodbus_write_coil(address, value, unit_kw)
+        except (ModbusIOException, ConnectionException, ModbusException) as exc:
+            raise RuntimeError(f"通讯异常: {exc}") from exc
+        if resp.isError():
+            raise RuntimeError(f"Modbus 异常响应: {_format_modbus_error(resp)}")
+
+    def write_multiple_coils(self, unit_id: int, address: int, values: list[bool]) -> None:
+        """功能码 0F：写多个线圈。"""
+        unit_kw = _unit_kwargs(unit_id)
+        try:
+            resp = self._call_pymodbus_write_coils(address, values, unit_kw)
         except (ModbusIOException, ConnectionException, ModbusException) as exc:
             raise RuntimeError(f"通讯异常: {exc}") from exc
         if resp.isError():
