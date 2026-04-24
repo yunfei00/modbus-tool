@@ -1,15 +1,36 @@
-# Modbus Tool V1
+# Modbus Studio V2
 
-基于 **Python + PySide6 + pymodbus** 的桌面版 Modbus 协议调试工具（最小可用版本），用于快速验证 Modbus TCP / RTU 读写与报文排查。
+基于 **Python + PySide6 + pymodbus** 的桌面版 Modbus 调试工具，在 V1 的 TCP/RTU 与 03/04/06/16 读写能力上，增加轮询、数据解析、配置与导出等能力。
+
+## 版本与常量
+
+- 应用名：`Modbus Studio`（代码中 `APP_NAME`）
+- 当前版本：`0.2.0`（`modbus_tool/version.py` 中 `APP_VERSION`）
 
 ## 功能概览
 
-- **Modbus TCP**：配置 IP、端口（默认 502）后连接。
-- **Modbus RTU**：配置串口、波特率（默认 9600）、数据位（默认 8）、校验（N/E/O）、停止位（默认 1）。
-- **功能码**：03 读保持寄存器、04 读输入寄存器、06 写单个保持寄存器、16 写多个保持寄存器。
-- **结果区**：表格展示寄存器地址（十进制）、数值（十进制 + 十六进制）。
-- **日志区**：连接、断开、请求摘要、成功/失败与异常信息，均带时间戳。
-- **异常提示**：未连接操作、参数非法、通讯超时/无响应、Modbus 异常码、TCP/串口连接失败等，弹窗 **QMessageBox** 并写入日志。
+### 通讯
+
+- **默认 RTU**：启动后通讯类型为 RTU，显示串口参数；TCP 保留，手动切换后显示 IP/端口。
+- **Modbus TCP / RTU**：连接、断开、从站地址（Unit ID）。
+- **串口**：启动自动扫描；**刷新串口**重新枚举；下拉仅显示设备名（如 `COM3`）。无可用串口时日志 `[WARN] 未检测到可用串口`。
+
+### 读写与轮询
+
+- **功能码**：03 读保持寄存器、04 读输入寄存器、06 写单寄存器、16 写多寄存器。
+- **周期轮询**（仅 03/04）：启用轮询、间隔（默认 1000 ms，最小 100 ms）、开始/停止；与手动执行互斥（未完成则跳过本次定时器）；断开连接自动停止。
+
+### 数据解析
+
+- **类型**：uint16、int16、uint32、int32、float32（默认 uint16）。
+- **字序**：AB CD（高字在前）、CD AB（字交换）；32 位与 float 每 **2 个寄存器** 一组，不足 2 个时解析列为空。
+- **结果表**：地址、原始十进制、原始十六进制、二进制、解析值。
+
+### 配置与导出
+
+- **保存配置 / 加载配置**：JSON，默认建议路径 `config/modbus_tool_config.json`（相对项目根目录，目录不存在会自动创建）。
+- **日志**：清空日志、保存日志为 `.txt`（自选路径）。
+- **导出 CSV**：导出当前表格全部列。
 
 ## 安装依赖
 
@@ -19,7 +40,7 @@
 pip install -r requirements.txt
 ```
 
-依赖包括：`PySide6`、`pymodbus`、`pyserial`（用于枚举串口）。
+依赖：`PySide6`、`pymodbus`、`pyserial`。
 
 ## 启动方式
 
@@ -27,41 +48,30 @@ pip install -r requirements.txt
 python main.py
 ```
 
-请确保当前工作目录为项目根目录，以便正确加载包 `modbus_tool`。
+请在项目根目录运行，以便正确加载包 `modbus_tool` 与默认 `config/` 路径。
 
-## 使用说明（简要）
-
-1. 选择 **TCP** 或 **RTU**，填写对应参数，设置 **从站地址 (Unit ID)**，点击 **连接**。
-2. 在 **操作** 区选择功能码，填写起始地址与数量（读操作；写多个寄存器时 **数量须与写入值个数一致**）。
-3. 写操作时在 **写入值** 中填写：单写如 `123`；多写如 `1,2,3,4`（英文逗号分隔）。
-4. 点击 **执行**，在 **结果** 与 **日志** 中查看反馈。
-
-## 项目结构
+## 项目结构（节选）
 
 ```text
-modbus-tool/               # 仓库根目录（示例名）
-  main.py
-  requirements.txt
-  README.md
-  modbus_tool/
+main.py
+requirements.txt
+README.md
+config/                         # 可选：保存 modbus_tool_config.json
+modbus_tool/
+  __init__.py
+  version.py                    # APP_NAME / APP_VERSION
+  app.py
+  core/
     __init__.py
-    app.py
-    core/
-      __init__.py
-      modbus_client.py
-    ui/
-      __init__.py
-      main_window.py
+    modbus_client.py
+    serial_utils.py
+    data_parser.py
+    config_manager.py
+  ui/
+    main_window.py
 ```
 
-## 后续 V2 计划（设想）
+## 说明
 
-- 读线圈 / 离散输入、写线圈等更多功能码。
-- 连接与请求异步化（后台线程），避免长超时阻塞界面。
-- 报文十六进制原始帧显示与导出。
-- 从站仿真 / 简单数据映射、脚本轮询与趋势图。
-- 多连接标签页、会话保存与更完善的国际化。
-
----
-
-当前版本聚焦 **单机调试、协议验证**，不包含插件系统、用户系统、数据库或复杂配置管理。
+- 不包含数据库、插件系统或复杂主题框架。
+- 轮询使用 **QTimer**，在同线程内执行；长时间阻塞仍可能影响界面响应。

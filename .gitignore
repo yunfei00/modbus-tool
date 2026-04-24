@@ -23,3 +23,6 @@ frontend/.git/
 Thumbs.db
 .DS_Store
 .env
+
+# Modbus Studio 本地 JSON 配置
+config/*.json
