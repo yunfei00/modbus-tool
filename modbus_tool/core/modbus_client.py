@@ -180,6 +180,38 @@ class ModbusClient:
             raise RuntimeError(f"Modbus 异常响应: {_format_modbus_error(resp)}")
         return list(resp.registers)
 
+    def read_coils(self, unit_id: int, address: int, count: int) -> list[int]:
+        """
+        功能码 01：读线圈。
+        :return: 0/1 列表
+        """
+        client = self._require_client()
+        unit_kw = _unit_kwargs(unit_id)
+        try:
+            resp = client.read_coils(address, count=count, **unit_kw)
+        except (ModbusIOException, ConnectionException, ModbusException) as exc:
+            raise RuntimeError(f"通讯异常: {exc}") from exc
+        if resp.isError():
+            raise RuntimeError(f"Modbus 异常响应: {_format_modbus_error(resp)}")
+        bits = list(resp.bits[:count])
+        return [1 if b else 0 for b in bits]
+
+    def read_discrete_inputs(self, unit_id: int, address: int, count: int) -> list[int]:
+        """
+        功能码 02：读离散输入。
+        :return: 0/1 列表
+        """
+        client = self._require_client()
+        unit_kw = _unit_kwargs(unit_id)
+        try:
+            resp = client.read_discrete_inputs(address, count=count, **unit_kw)
+        except (ModbusIOException, ConnectionException, ModbusException) as exc:
+            raise RuntimeError(f"通讯异常: {exc}") from exc
+        if resp.isError():
+            raise RuntimeError(f"Modbus 异常响应: {_format_modbus_error(resp)}")
+        bits = list(resp.bits[:count])
+        return [1 if b else 0 for b in bits]
+
     # ------------------------------------------------------------------ 写
     def write_single_register(self, unit_id: int, address: int, value: int) -> None:
         """功能码 06：写单个保持寄存器。"""
