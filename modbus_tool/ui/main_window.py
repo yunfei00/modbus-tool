@@ -71,6 +71,8 @@ class MainWindow(QWidget):
     """Modbus Studio 主界面。"""
 
     FC_OPTIONS = (
+        ("01", "01 Read Coils"),
+        ("02", "02 Read Discrete Inputs"),
         ("03", "03 Read Holding Registers"),
         ("04", "04 Read Input Registers"),
         ("05", "05 Write Single Coil"),
@@ -234,9 +236,10 @@ class MainWindow(QWidget):
         row_unit.setSpacing(6)
         row_unit.addWidget(QLabel("从站地址:"))
         self.spin_unit = QSpinBox()
-        self.spin_unit.setRange(1, 247)
+        self.spin_unit.setRange(1, 254)
         self.spin_unit.setValue(1)
         self.spin_unit.setMinimumWidth(72)
+        self.spin_unit.setToolTip("支持 1~254（0x01~0xFE）")
         row_unit.addWidget(self.spin_unit)
         row_unit.addStretch()
         conn_layout.addLayout(row_unit)
@@ -600,7 +603,7 @@ class MainWindow(QWidget):
 
     def _update_fc_dependent_widgets(self) -> None:
         fc = self._current_fc()
-        is_read = fc in ("03", "04")
+        is_read = fc in ("01", "02", "03", "04")
         is_single = fc in ("05", "06")
         is_multi = fc in ("0F", "16")
 
@@ -609,6 +612,12 @@ class MainWindow(QWidget):
             self.spin_count.setEnabled(False)
         else:
             self.spin_count.setEnabled(is_read or is_multi)
+        if fc in ("01", "02"):
+            self.spin_count.setRange(1, 2000)
+        elif fc in ("03", "04"):
+            self.spin_count.setRange(1, 125)
+        else:
+            self.spin_count.setRange(1, 123)
 
         self.edit_values.setEnabled(is_single or is_multi)
         self.edit_batch_addrs.setEnabled(is_read)
@@ -640,7 +649,7 @@ class MainWindow(QWidget):
         self._update_table_write_controls()
 
     def _update_poll_controls_enabled(self) -> None:
-        fc_ok = self._current_fc() in ("03", "04")
+        fc_ok = self._current_fc() in ("01", "02", "03", "04")
         self.chk_poll.setEnabled(fc_ok)
         self.spin_poll_interval.setEnabled(fc_ok and not self._polling_active)
         can_start = (
@@ -664,7 +673,7 @@ class MainWindow(QWidget):
         self.btn_write_selected.setEnabled(can_write_table and has_rows and has_selection)
         self.btn_write_all_modified.setEnabled(can_write_table and pending_count > 0)
         self.combo_table_write_fc.setEnabled(is_holding_read and has_rows)
-        self.btn_reread.setEnabled(has_rows and self._current_fc() in ("03", "04"))
+        self.btn_reread.setEnabled(has_rows and self._current_fc() in ("01", "02", "03", "04"))
         if not is_holding_read:
             self.btn_write_selected.setToolTip("仅功能码 03 结果支持表格写回")
             self.btn_write_all_modified.setToolTip("仅功能码 03 结果支持表格写回")
@@ -710,8 +719,8 @@ class MainWindow(QWidget):
         if not self._client.is_connected():
             self._show_warning("未连接", "请先连接设备再开始轮询。")
             return
-        if self._current_fc() not in ("03", "04"):
-            self._show_warning("轮询", "仅支持功能码 03 / 04 轮询。")
+        if self._current_fc() not in ("01", "02", "03", "04"):
+            self._show_warning("轮询", "仅支持功能码 01 / 02 / 03 / 04 轮询。")
             return
         if not self.chk_poll.isChecked():
             self._show_warning("轮询", "请先勾选「启用轮询」。")
@@ -744,7 +753,7 @@ class MainWindow(QWidget):
                 self.append_log("INFO", "请求节流：上一次请求未完成，跳过本次轮询。")
                 self._throttle_warn_ts = now
             return
-        if self._current_fc() not in ("03", "04"):
+        if self._current_fc() not in ("01", "02", "03", "04"):
             self._stop_polling_internal()
             return
         self._poll_busy = True
@@ -1002,6 +1011,10 @@ class MainWindow(QWidget):
         return values
 
     def _do_read_single_address(self, fc: str, unit_id: int, address: int) -> int:
+        if fc == "01":
+            return self._client.read_coils(unit_id, address, 1)[0]
+        if fc == "02":
+            return self._client.read_discrete_inputs(unit_id, address, 1)[0]
         if fc == "03":
             return self._client.read_holding_registers(unit_id, address, 1)[0]
         return self._client.read_input_registers(unit_id, address, 1)[0]
@@ -1068,9 +1081,15 @@ class MainWindow(QWidget):
     def _perform_read_and_fill(self, log_tx_rx: bool, log_ok: bool) -> None:
         unit_id = int(self.spin_unit.value())
         fc = self._current_fc()
-        if fc not in ("03", "04"):
-            raise RuntimeError("仅支持读保持/输入寄存器")
-        name = "保持寄存器" if fc == "03" else "输入寄存器"
+        if fc not in ("01", "02", "03", "04"):
+            raise RuntimeError("仅支持读功能码 01/02/03/04")
+        read_name_map = {
+            "01": "线圈",
+            "02": "离散输入",
+            "03": "保持寄存器",
+            "04": "输入寄存器",
+        }
+        name = read_name_map[fc]
         batch_addrs = self._parse_batch_addresses()
         self._batch_mode = bool(batch_addrs)
         self._batch_addresses = list(batch_addrs)
@@ -1098,7 +1117,11 @@ class MainWindow(QWidget):
                     "TX",
                     f"读取{name}：unit={unit_id}, address={address}, count={count}",
                 )
-            if fc == "03":
+            if fc == "01":
+                regs = self._client.read_coils(unit_id, address, count)
+            elif fc == "02":
+                regs = self._client.read_discrete_inputs(unit_id, address, count)
+            elif fc == "03":
                 regs = self._client.read_holding_registers(unit_id, address, count)
             else:
                 regs = self._client.read_input_registers(unit_id, address, count)
@@ -1184,7 +1207,7 @@ class MainWindow(QWidget):
             fc = self._current_fc()
             raw_values = self.edit_values.text()
 
-            if fc in ("03", "04"):
+            if fc in ("01", "02", "03", "04"):
                 self._perform_read_and_fill(log_tx_rx=True, log_ok=True)
                 self._record_success()
 
@@ -1273,8 +1296,8 @@ class MainWindow(QWidget):
             self._set_exec_busy(False)
 
     def _on_read_once(self) -> None:
-        if self._current_fc() not in ("03", "04"):
-            self.append_log("WARN", "一键读取仅支持功能码 03 / 04。")
+        if self._current_fc() not in ("01", "02", "03", "04"):
+            self.append_log("WARN", "一键读取仅支持功能码 01 / 02 / 03 / 04。")
             return
         self.append_log("INFO", "触发一键读取。")
         self._on_execute()
@@ -1283,7 +1306,7 @@ class MainWindow(QWidget):
         if not self._client.is_connected():
             self._warn_not_connected_execute()
             return
-        if self._current_fc() not in ("03", "04"):
+        if self._current_fc() not in ("01", "02", "03", "04"):
             self._show_warning("重新读取", "当前功能码不支持重新读取。")
             return
         if not self._table_rows:
@@ -1297,7 +1320,11 @@ class MainWindow(QWidget):
             if batch_addrs:
                 self.append_log("TX", f"重新读取批量地址：{batch_addrs}")
                 for addr in batch_addrs:
-                    if fc == "03":
+                    if fc == "01":
+                        values_by_addr[addr] = self._client.read_coils(unit_id, addr, 1)[0]
+                    elif fc == "02":
+                        values_by_addr[addr] = self._client.read_discrete_inputs(unit_id, addr, 1)[0]
+                    elif fc == "03":
                         values_by_addr[addr] = self._client.read_holding_registers(unit_id, addr, 1)[0]
                     else:
                         values_by_addr[addr] = self._client.read_input_registers(unit_id, addr, 1)[0]
@@ -1305,7 +1332,11 @@ class MainWindow(QWidget):
                 start = int(self.spin_addr.value())
                 count = int(self.spin_count.value())
                 self.append_log("TX", f"重新读取范围：address={start}, count={count}")
-                if fc == "03":
+                if fc == "01":
+                    regs = self._client.read_coils(unit_id, start, count)
+                elif fc == "02":
+                    regs = self._client.read_discrete_inputs(unit_id, start, count)
+                elif fc == "03":
                     regs = self._client.read_holding_registers(unit_id, start, count)
                 else:
                     regs = self._client.read_input_registers(unit_id, start, count)
